@@ -1,0 +1,60 @@
+# .gitignore for Plant Language Model Training
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Data files
+data/**/*.fna
+data/**/*.fa
+data/**/*.fasta
+data/**/*.gz
+data/**/*.zip
+
+# Model checkpoints and outputs
+dna_model/
+*.pt
+*.pth
+*.ckpt
+
+# Logs
+logs/
+*.log
+
+# WandB
+wandb/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pytest
+.pytest_cache/
+
+# Keep directory structure but ignore contents
+!data/README.md
+!dna_model/.gitkeep
+!logs/.gitkeep

@@ -1,60 +1,66 @@
-# .gitignore for Plant Language Model Training
+# =========================
+# 1. 数据集（核心忽略）
+# =========================
+data/
+datasets/
+genome_data/
 
-# Virtual Environment
-venv/
-env/
-ENV/
-.venv/
+*.fa
+*.fna
+*.fasta
+*.fastq
+*.fq
+*.gz
 
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-
-# Data files
-data/**/*.fna
-data/**/*.fa
-data/**/*.fasta
-data/**/*.gz
-data/**/*.zip
-
-# Model checkpoints and outputs
-dna_model/
+*.npy
+*.npz
+*.h5
+*.hdf5
 *.pt
 *.pth
 *.ckpt
+*.pkl
 
-# Logs
+
+# =========================
+# 2. 训练输出 & 日志
+# =========================
+dna_model/
+checkpoints/
+models/
+runs/
+wandb/
 logs/
 *.log
 
-# WandB
-wandb/
 
-# IDE
+# =========================
+# 3. Python & 构建缓存
+# =========================
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+
+
+# =========================
+# 4. 虚拟环境
+# =========================
+venv/
+.venv/
+env/
+.env/
+
+
+# =========================
+# 5. 编辑器 & 系统垃圾
+# =========================
 .vscode/
 .idea/
+*.iml
+.DS_Store
+Thumbs.db
 *.swp
 *.swo
-*~
-
-# macOS
-.DS_Store
-
-# Distribution / packaging
-dist/
-build/
-*.egg-info/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# pytest
-.pytest_cache/
-
-# Keep directory structure but ignore contents
-!data/README.md
-!dna_model/.gitkeep
-!logs/.gitkeep

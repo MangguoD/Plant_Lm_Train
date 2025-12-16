@@ -13,7 +13,7 @@ from einops import rearrange
 import time
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 import argparse
 import psutil
 import threading
@@ -27,11 +27,12 @@ cudnn.benchmark = True  # 让 cuDNN 自动选更快的算法
 # 配置参数
 # ====================
 class Config:
-    d_model = 512
+    # 模型容量
+    d_model = 640
     n_buckets = 4096  # 6-mer 词表大小
 
     # 显存 & 吞吐主要看这几个
-    batch_size = 512
+    batch_size = 160
     context_size = 128
     local_attn_window = 128
 
@@ -39,27 +40,30 @@ class Config:
     n_epochs = 10
 
     # 学习率 warmup（按 global_step）
-    warmup_steps = 1000          # 前多少个 global_step 线性升 lr
+    warmup_steps = 1000
 
-    # 旧的按 epoch 衰减参数保留但不再使用
+    # 学习率衰减（按 epoch）
     lr_decay_start_epoch = 3
     lr_decay_factor = 0.5
-
-    min_lr = 1e-6                # ReduceLROnPlateau 的下限
+    min_lr = 1e-6
 
     global_context = 200000  # 位置 embedding 上限
-    n_heads = 8
+    n_heads = 10
     dropout = 0.1
     n_layers = 6
     temperature = 0.8
 
     chunk_size = 1200000     # 每次从基因组切出的碱基数
-    bucket_norm_freq = 1000
+
+    # 桶相关配置
+    bucket_norm_freq = 1000      # 每多少次 bucket 更新做一次归一化
+    use_bucket_updater = True    # 开启桶机制
+
     save_dir = "dna_model"
     accumulation_steps = 1
 
     # DataLoader 设置
-    num_workers = 8          # 每 GPU 最大 dataloader worker 数
+    num_workers = 8
     overlap_ratio = 0.5
     log_interval = 100       # 打印间隔（global_step）
 
@@ -70,9 +74,6 @@ class Config:
 
     mixed_precision = True
     grad_clip = 1.0
-
-    # 桶矩阵异步更新开关：目前完全不启用（训练中已硬关）
-    use_bucket_updater = False
 
     # 验证 / 测试最多跑多少个 batch（防止太慢）
     val_max_steps = 200
@@ -114,27 +115,24 @@ class GenomeIterableDataset(IterableDataset):
     def __init__(self, species_files, config: Config, split: str = "train"):
         assert split in ("train", "val", "test")
         self.config = config
-        self.species_files = species_files              # {species_name: [file1, file2, ...]}
+        self.species_files = species_files
         self.species_list = list(species_files.keys())
         self.split = split
 
-        # 使用固定的 8:1:1 切分比例
-        # bucket = sample_idx % 10
-        # 0-7 -> train, 8 -> val, 9 -> test
+        # 固定 8:1:1 切分比例
         self.split_bucket = {
             "train": (0, 8),
             "val": (8, 9),
             "test": (9, 10)
         }
 
-        # 粗略估一下面数据量（给 __len__ 用，近似即可）
+        # 粗略估计数据量（__len__ 用，近似即可）
         base_total_chunks = 0
-        for species, files in species_files.items():
+        for _, files in species_files.items():
             for f in files:
                 file_size = os.path.getsize(f)
                 base_total_chunks += file_size // (config.chunk_size * 2)
 
-        # 近似分配比例
         ratio_map = {"train": 0.8, "val": 0.1, "test": 0.1}
         self.total_chunks = int(base_total_chunks * ratio_map[self.split])
 
@@ -147,13 +145,10 @@ class GenomeIterableDataset(IterableDataset):
             worker_id = worker_info.id
             num_workers = worker_info.num_workers
 
-        # 按 worker_id 切物种，避免不同 worker 完全重复
         worker_species = self.species_list[worker_id::num_workers]
-
         if len(worker_species) == 0:
             return
 
-        # 每次 __iter__ 随机打乱物种和文件顺序，相当于 epoch 级 shuffle
         rng = np.random.default_rng()
         species_order = list(worker_species)
         rng.shuffle(species_order)
@@ -194,7 +189,6 @@ class GenomeIterableDataset(IterableDataset):
             bucket = sample_idx % 10
             sample_idx += 1
 
-            # 不属于当前 split 的样本直接跳过
             if not (bucket_start <= bucket < bucket_end):
                 continue
 
@@ -207,7 +201,6 @@ class GenomeIterableDataset(IterableDataset):
             }
 
     def __len__(self):
-        # 近似值，只是用来感知规模，不参与训练逻辑
         return self.total_chunks * (self.config.chunk_size // (self.config.context_size * 3))
 
 
@@ -230,7 +223,7 @@ def genome_collate_fn(batch):
 
 
 # ====================
-# 桶矩阵异步更新（当前训练中完全禁用，只保留代码备查）
+# 异步桶更新（目前未在训练中使用线程）
 # ====================
 class BucketUpdater:
     def __init__(self, model, config: Config):
@@ -252,13 +245,13 @@ class BucketUpdater:
 
             tokens, positions, species = batch_data
             with torch.no_grad():
-                self.model.update_bucket(tokens, positions, species)
+                self.model.update_bucket(tokens, positions)
                 self.update_count += 1
 
                 if self.update_count % self.config.bucket_norm_freq == 0:
-                    self.model.normalize_buckets(species)
+                    self.model.normalize_buckets()
                     if dist.is_initialized() and dist.get_rank() == 0:
-                        print(f"Normalized buckets for {species} at update {self.update_count}", flush=True)
+                        print(f"Normalized buckets at update {self.update_count}", flush=True)
 
     def add_batch(self, tokens, positions, species):
         if self.queue.full():
@@ -335,10 +328,11 @@ class CausalLocalAttention(nn.Module):
 
 class GlobalAttention(nn.Module):
     """
-    全局桶注意力：当前训练版本中不再调用，只保留实现以便后续实验。
+    全局桶注意力：使用共享 bucket_matrix: [n_buckets, d_model]。
     """
     def __init__(self, d_model, n_heads, n_buckets, dropout=0.1):
         super().__init__()
+        assert d_model % n_heads == 0
         self.n_heads = n_heads
         self.n_buckets = n_buckets
         self.d_head = d_model // n_heads
@@ -349,18 +343,20 @@ class GlobalAttention(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
 
     def forward(self, x, bucket_matrix):
+        """
+        x: [B, S, D]
+        bucket_matrix: [N_buckets, D]
+        """
         batch_size, seq_len, _ = x.shape
 
         q = self.q_proj(x)
         q = rearrange(q, 'b s (h d) -> b h s d', h=self.n_heads)
 
-        kv = self.kv_proj(bucket_matrix)
-        k, v = torch.chunk(kv, 2, dim=-1)
+        kv = self.kv_proj(bucket_matrix)       # [N_buckets, 2D]
+        k, v = torch.chunk(kv, 2, dim=-1)      # [N_buckets, D] x2
 
-        k = rearrange(k, 'n (h d) -> 1 h n d', h=self.n_heads)
-        v = rearrange(v, 'n (h d) -> 1 h n d', h=self.n_heads)
-        k = k.expand(batch_size, -1, -1, -1)
-        v = v.expand(batch_size, -1, -1, -1)
+        k = rearrange(k, 'n (h d) -> 1 h n d', h=self.n_heads).expand(batch_size, -1, -1, -1)
+        v = rearrange(v, 'n (h d) -> 1 h n d', h=self.n_heads).expand(batch_size, -1, -1, -1)
 
         attn_scores = torch.einsum('bhsd,bhnd->bhsn', q, k) / math.sqrt(self.d_head)
 
@@ -384,7 +380,6 @@ class DNALayer(nn.Module):
             dropout=config.dropout
         )
 
-        # 原始版本：带全局桶注意力（当前未使用）
         self.global_attn = GlobalAttention(
             config.d_model,
             config.n_heads,
@@ -404,17 +399,16 @@ class DNALayer(nn.Module):
         self.norm3 = nn.LayerNorm(config.d_model)
 
     def forward(self, x, positions, bucket_matrix=None):
-        """
-        当前训练版本：
-        - 只使用局部因果注意力 + FFN
-        - 全局桶注意力完全跳过（但代码保留）
-        """
         # 局部注意力
-        attn_out = self.local_attn(x)
-        x = self.norm1(x + attn_out)
+        local_out = self.local_attn(x)
+        x = self.norm1(x + local_out)
 
-        # 全局注意力分支当前禁用，仅执行第二次 LayerNorm
-        x = self.norm2(x)
+        # 全局桶注意力
+        if bucket_matrix is not None:
+            global_out = self.global_attn(x, bucket_matrix)
+            x = self.norm2(x + global_out)
+        else:
+            x = self.norm2(x)
 
         # FFN
         ffn_out = self.ffn(x)
@@ -433,11 +427,15 @@ class DNAModel(nn.Module):
         self.pos_embed = nn.Embedding(config.global_context, config.d_model)
         self.species_embed = nn.Embedding(len(species_list), config.d_model)
 
-        # 原始版本：物种特定桶矩阵（当前未实际使用）
-        self.bucket_matrices = nn.ParameterDict({
-            species: nn.Parameter(torch.zeros(config.n_buckets, config.d_model))
-            for species in species_list
-        })
+        # ---- 关键改动：bucket_matrix / bucket_count 作为 buffer，不参与 AdamW ----
+        self.register_buffer(
+            "bucket_matrix",
+            torch.zeros(config.n_buckets, config.d_model)
+        )
+        self.register_buffer(
+            "bucket_count",
+            torch.zeros(config.n_buckets, dtype=torch.float32)
+        )
 
         self.layers = nn.ModuleList([
             DNALayer(config) for _ in range(config.n_layers)
@@ -459,33 +457,52 @@ class DNAModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def get_bucket_matrix(self, species):
-        return self.bucket_matrices[species]
-
-    def update_bucket(self, token_indices, token_positions, species):
+    def update_bucket(self, token_indices, token_positions, momentum: float = 0.001):
         """
-        原始设计：异步桶更新会调用。
-        当前训练版本中不会被调用。
+        用当前位置 embedding 对 bucket 做滑动平均更新：
+            m_new = (1 - momentum) * m_old + momentum * pos_vec
+        token_indices: [B, L]
+        token_positions: [B, L]
         """
         device = self.pos_embed.weight.device
         token_indices = token_indices.to(device=device, dtype=torch.long)
         token_positions = token_positions.to(device=device, dtype=torch.long)
 
-        pos_vecs = self.pos_embed(token_positions)
-        bucket_matrix = self.bucket_matrices[species]
-
-        bucket_matrix.index_add_(
-            dim=0,
-            index=token_indices,
-            source=pos_vecs
-        )
-
-    def normalize_buckets(self, species):
-        bucket_matrix = self.bucket_matrices[species]
         with torch.no_grad():
-            norms = torch.norm(bucket_matrix, p=2, dim=1, keepdim=True)
+            # 位置向量 [B, L, D]
+            pos_vecs = self.pos_embed(token_positions)
+            # 每个样本平均一下 [B, D]
+            pos_vecs = pos_vecs.mean(dim=1)
+
+            B, L = token_indices.shape
+            flat_index = token_indices.view(-1)               # [B*L]
+            flat_pos = pos_vecs.repeat_interleave(L, dim=0)   # [B*L, D]
+
+            # unique 聚合到每个 bucket
+            uniq_index, inverse = torch.unique(flat_index, return_inverse=True)  # [K], [B*L]
+
+            bucket_updates = torch.zeros(
+                uniq_index.size(0),
+                self.config.d_model,
+                device=device
+            )
+            bucket_updates.index_add_(0, inverse, flat_pos)
+
+            counts = torch.bincount(inverse, minlength=uniq_index.size(0)).float().unsqueeze(1)
+            bucket_updates = bucket_updates / counts  # [K, D]
+
+            old_vecs = self.bucket_matrix[uniq_index]  # [K, D]
+            new_vecs = (1.0 - momentum) * old_vecs + momentum * bucket_updates
+            self.bucket_matrix[uniq_index] = new_vecs
+
+            # 如果你以后要按频次做别的事情，可以用 bucket_count
+            self.bucket_count[uniq_index] += counts.squeeze(1)
+
+    def normalize_buckets(self):
+        with torch.no_grad():
+            norms = torch.norm(self.bucket_matrix, p=2, dim=1, keepdim=True)
             norms = torch.where(norms > 0, norms, torch.ones_like(norms))
-            bucket_matrix.div_(norms)
+            self.bucket_matrix.div_(norms)
 
     def forward(self, input_tokens, token_positions, species_ids):
         token_embeds = self.token_embed(input_tokens)
@@ -494,9 +511,10 @@ class DNAModel(nn.Module):
 
         x = token_embeds + pos_embeds + species_embeds
 
-        # 当前版本：完全不使用 bucket_matrix，全模型退化为「纯局部 Transformer」
+        bucket_matrix = self.bucket_matrix
+
         for layer in self.layers:
-            x = layer(x, token_positions, bucket_matrix=None)
+            x = layer(x, token_positions, bucket_matrix=bucket_matrix)
 
         x = self.final_norm(x)
         logits = self.classifier(x)
@@ -514,7 +532,8 @@ def setup_distributed(rank, world_size):
 
 
 def cleanup_distributed():
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 # ====================
@@ -528,13 +547,6 @@ def evaluate(rank,
              global_step,
              writer=None,
              split_name: str = "val"):
-    """
-    简单评估：
-    - 只在 rank0 调用
-    - 只跑 config.val_max_steps 个 batch
-    - 输出平均 token loss 和 ppl
-    - 返回 avg_loss，便于保存 best model 和驱动 LR 调度
-    """
     if dataloader is None:
         return float("nan")
 
@@ -544,7 +556,6 @@ def evaluate(rank,
     total_loss = 0.0
     total_tokens = 0
 
-    # 评估阶段使用标准 CE（不做 label smoothing），方便解释 loss
     criterion = nn.CrossEntropyLoss(reduction="sum")
 
     with torch.no_grad():
@@ -589,6 +600,7 @@ def evaluate(rank,
             writer.add_scalar(f"{split_name}/ppl", ppl, global_step)
 
     model.train()
+    torch.cuda.empty_cache()
     return avg_loss
 
 
@@ -599,7 +611,6 @@ def train_worker(rank, world_size, config: Config, species_files):
     setup_distributed(rank, world_size)
     device = torch.device(f"cuda:{rank}")
 
-    # 只有 rank0 写 TensorBoard
     writer = SummaryWriter(log_dir=config.tb_log_dir) if rank == 0 else None
 
     # ========= 构建 train / val / test 数据集 =========
@@ -621,9 +632,9 @@ def train_worker(rank, world_size, config: Config, species_files):
         batch_size=config.batch_size,
         num_workers=effective_workers,
         pin_memory=True,
-        persistent_workers=(effective_workers > 0),
+        persistent_workers=False,
         collate_fn=genome_collate_fn,
-        prefetch_factor=4
+        prefetch_factor=2
     )
 
     # 验证集 / 测试集仅在 rank0 构建和使用
@@ -658,9 +669,8 @@ def train_worker(rank, world_size, config: Config, species_files):
 
     species_list = list(species_files.keys())
     model = DNAModel(config, species_list).to(device)
-    model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+    model = DDP(model, device_ids=[rank], find_unused_parameters=False)
 
-    # ===== 训练损失：加入 label smoothing =====
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     optimizer = torch.optim.AdamW(
@@ -669,27 +679,29 @@ def train_worker(rank, world_size, config: Config, species_files):
         weight_decay=0.01
     )
 
-    # 基于验证集 loss 的学习率调度器（warmup 之后生效）
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=0.5,
-        patience=1,
-        threshold=1e-3,
-        min_lr=config.min_lr
-    )
-
     scaler = GradScaler(enabled=config.mixed_precision)
-
-    bucket_updater = None  # 当前版本：训练中完全关闭桶异步更新
 
     global_step = 0
     best_val_loss = float("inf") if rank == 0 else None
+
+    # 统计 bucket 更新次数（用来触发 normalize）
+    bucket_update_count = 0
 
     for epoch in range(config.n_epochs):
         model.train()
         if rank == 0:
             print(f"\n===== Epoch {epoch} started =====", flush=True)
+
+        # epoch 级 LR 基准
+        if epoch < config.lr_decay_start_epoch:
+            epoch_base_lr = config.learning_rate
+        else:
+            decay_steps = epoch - config.lr_decay_start_epoch + 1
+            epoch_base_lr = config.learning_rate * (config.lr_decay_factor ** decay_steps)
+            epoch_base_lr = max(epoch_base_lr, config.min_lr)
+
+        if rank == 0:
+            print(f"[Epoch {epoch}] base_lr={epoch_base_lr:.6e}", flush=True)
 
         epoch_loss = 0.0
         epoch_samples = 0
@@ -708,7 +720,7 @@ def train_worker(rank, world_size, config: Config, species_files):
                 device=device
             )
 
-            with autocast(enabled=config.mixed_precision):
+            with autocast(device_type="cuda", enabled=config.mixed_precision):
                 logits = model(tokens, positions, species_ids)
                 loss = criterion(
                     logits.view(-1, config.n_buckets),
@@ -728,23 +740,43 @@ def train_worker(rank, world_size, config: Config, species_files):
 
                 global_step += 1
 
-                # global_step 级别 warmup（仅在前 warmup_steps 生效）
+                # global_step 级 warmup
                 if global_step <= config.warmup_steps:
                     lr_scale = float(global_step) / float(max(1, config.warmup_steps))
-                    current_lr = config.learning_rate * lr_scale
-                    for pg in optimizer.param_groups:
-                        pg["lr"] = current_lr
                 else:
-                    # warmup 结束后，不再手动覆盖 LR，完全交给 scheduler
-                    current_lr = optimizer.param_groups[0]["lr"]
+                    lr_scale = 1.0
+
+                current_lr = epoch_base_lr * lr_scale
+
+                for pg in optimizer.param_groups:
+                    pg["lr"] = current_lr
 
                 if rank == 0 and writer is not None:
                     writer.add_scalar("train/lr", current_lr, global_step)
 
+                # ======= 桶机制：同步更新 bucket_matrix =======
+                if config.use_bucket_updater:
+                    with torch.no_grad():
+                        model.module.update_bucket(
+                            tokens.detach(),
+                            positions.detach(),
+                            momentum=0.001
+                        )
+                        bucket_update_count += 1
+
+                        if bucket_update_count % config.bucket_norm_freq == 0:
+                            model.module.normalize_buckets()
+                            if rank == 0:
+                                print(
+                                    f"[Bucket] normalize at global_step={global_step}, "
+                                    f"updates={bucket_update_count}",
+                                    flush=True
+                                )
+
             epoch_loss += loss.item() * config.accumulation_steps
             epoch_samples += tokens.size(0)
 
-            # 日志：每 log_interval 打一次
+            # 日志
             if rank == 0 and (global_step > 0 and global_step % config.log_interval == 0):
                 elapsed = time.time() - start_time
                 samples_per_sec = epoch_samples / elapsed if elapsed > 0 else 0
@@ -764,7 +796,7 @@ def train_worker(rank, world_size, config: Config, species_files):
                     writer.add_scalar("train/throughput", samples_per_sec, global_step)
                     writer.add_scalar("system/memory_percent", mem_usage, global_step)
 
-        # ====== 每个 epoch 结束后：rank0 做一次验证 ======
+        # ====== 每个 epoch 结束后：rank0 做一次验证 + 保存 ckpt / best_model ======
         if rank == 0:
             val_loss = evaluate(
                 rank=rank,
@@ -776,22 +808,7 @@ def train_worker(rank, world_size, config: Config, species_files):
                 writer=writer,
                 split_name="val"
             )
-        else:
-            val_loss = float("nan")
 
-        # 同步 val_loss，保证所有 rank 的 scheduler 使用同一数值
-        if dist.is_initialized():
-            val_loss_tensor = torch.tensor(val_loss, device=device)
-            dist.broadcast(val_loss_tensor, src=0)
-            val_loss_for_sched = val_loss_tensor.item()
-        else:
-            val_loss_for_sched = val_loss
-
-        # 使用验证集 loss 驱动学习率调度（所有 rank 均调用，保证 LR 一致）
-        scheduler.step(val_loss_for_sched)
-
-        # ====== rank0 保存 ckpt / best_model ======
-        if rank == 0:
             save_path = Path(config.save_dir) / f"model_epoch_{epoch}.pt"
             torch.save({
                 'model_state_dict': model.module.state_dict(),
@@ -813,7 +830,7 @@ def train_worker(rank, world_size, config: Config, species_files):
                 }, best_path)
                 print(f"[rank 0] New best model saved to {best_path}", flush=True)
 
-    # 全部训练结束后，rank0 额外做一次 test 评估（仅用于汇报）
+    # 全部训练结束后，rank0 额外做一次 test 评估
     if rank == 0 and test_dataloader is not None:
         _ = evaluate(
             rank=rank,

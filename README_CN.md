@@ -251,6 +251,15 @@ num_workers = 2          # 减少
 }
 ```
 
+### 推理
+python inference.py     --sequence "ACGTACGTAGCTAGCTAGCT"     --device cpu
+代码里需设置推理模型参数，推理参数在autodl-tmp/Plant_Lm_Train/downstream/model/
+其中，sequence的序列长度为[5000,64]，如果不满足则会自动扩增
+device设置auto则会自动识别
+需要安装python包Bio,eniops, torch
+其中，前端需要获取的是pred_label值
+按样本传入，一次传1个样本
+
 ## 许可证
 
 MIT License
